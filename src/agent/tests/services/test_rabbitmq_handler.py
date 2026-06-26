@@ -1,10 +1,12 @@
 import asyncio
 import contextlib
 import os
+import pickle
 import threading
 import time
 
 import pytest
+
 from aidev_agent.packages.langchain_core.models.llm_gateway import ChatModel
 from aidev_agent.pydantic_models import ChatPrompt, ExecuteKwargs
 from aidev_agent.services.agent import ChatCompletionAgent
@@ -35,7 +37,32 @@ def thread_id(request, handler):
         handler.mark_completed(tid)
 
 
+class DelayedPublishChannel:
+    def __init__(self, channel, target_message, publish_started, allow_publish):
+        self._channel = channel
+        self._target_message = target_message
+        self._publish_started = publish_started
+        self._allow_publish = allow_publish
+
+    def __getattr__(self, name):
+        return getattr(self._channel, name)
+
+    def basic_publish(self, *args, **kwargs):
+        body = kwargs.get("body")
+        if body is None and len(args) >= 3:
+            body = args[2]
+        try:
+            is_target = pickle.loads(body) == self._target_message
+        except Exception:
+            is_target = False
+        if is_target:
+            self._publish_started.set()
+            assert self._allow_publish.wait(timeout=3)
+        return self._channel.basic_publish(*args, **kwargs)
+
+
 class TestRabbitMQMessageHandler:
+
     def _get_open_channel_count(self, handler: RabbitMQMessageHandler) -> int:
         """Return open AMQP channels held by one pooled connection."""
         connection = handler._connection_pool.get_connection()
@@ -52,6 +79,28 @@ class TestRabbitMQMessageHandler:
                 return
             time.sleep(0.1)
         assert handler.is_empty(thread_id) is True
+
+    def _consume_since_offset(self, handler, thread_id, offset, result, error):
+        try:
+            result.append(handler.get_messages_since(thread_id, offset, timeout=1))
+        except Exception as exc:
+            error.append(exc)
+
+    def _patch_delayed_publish(self, monkeypatch, handler, target_message):
+        publish_started = threading.Event()
+        allow_publish = threading.Event()
+
+        def wrap_context(context_factory):
+            @contextlib.contextmanager
+            def wrapped(*args, **kwargs):
+                with context_factory(*args, **kwargs) as channel:
+                    yield DelayedPublishChannel(channel, target_message, publish_started, allow_publish)
+
+            return wrapped
+
+        monkeypatch.setattr(handler, "_with_channel", wrap_context(handler._with_channel))
+        monkeypatch.setattr(handler, "_with_replay_lock", wrap_context(handler._with_replay_lock))
+        return publish_started, allow_publish
 
     def test_repeated_operations_do_not_accumulate_open_channels(self, handler, thread_id):
         """Repeated RabbitMQ operations should close their temporary AMQP channels."""
@@ -210,6 +259,78 @@ class TestRabbitMQMessageHandler:
         assert all(result == expected for result in results)
 
         self._wait_until_empty(handler, thread_id)
+
+    def test_single_consumer_waits_for_in_flight_flush_before_later_buffer(self, handler, thread_id, monkeypatch):
+        """单个 consumer 不应在旧 flush 批次发布完成前先吐出后续 buffer 消息。"""
+        handler.put(thread_id, "msg_0")
+        handler.flush(thread_id)
+        first_messages, offset = handler.get_messages_since(thread_id, 0, timeout=1)
+        assert first_messages == ["msg_0"]
+
+        handler.put(thread_id, "msg_1")
+        publish_started, allow_publish = self._patch_delayed_publish(monkeypatch, handler, "msg_1")
+        result: list[tuple[list[str], int]] = []
+        error: list[Exception] = []
+        flush_thread = threading.Thread(target=handler.flush, args=(thread_id,), daemon=True)
+        consumer_thread = threading.Thread(
+            target=self._consume_since_offset, args=(handler, thread_id, offset, result, error), daemon=True
+        )
+        flush_thread.start()
+        assert publish_started.wait(timeout=3)
+        handler.put(thread_id, "msg_2")
+        consumer_thread.start()
+        try:
+            consumer_thread.join(timeout=0.3)
+            assert consumer_thread.is_alive(), f"consumer returned too early: result={result}, error={error}"
+        finally:
+            allow_publish.set()
+            flush_thread.join(timeout=3)
+            consumer_thread.join(timeout=3)
+
+        assert error == []
+        assert result == [(["msg_1", "msg_2"], 3)]
+
+    def test_replay_reader_does_not_block_producer_flush(self, handler, thread_id, monkeypatch):
+        """正在等待增量的 replay consumer 不应阻塞 producer flush 新消息。"""
+        handler.put(thread_id, "seed")
+        handler.flush(thread_id)
+        _, offset = handler.get_messages_since(thread_id, 0, timeout=1)
+
+        original_peek = handler._peek_queue_messages
+        reader_holding_snapshot = threading.Event()
+        release_reader_snapshot = threading.Event()
+
+        def slow_peek(channel, queue_name):
+            reader_holding_snapshot.set()
+            assert release_reader_snapshot.wait(timeout=3)
+            return original_peek(channel, queue_name)
+
+        monkeypatch.setattr(handler, "_peek_queue_messages", slow_peek)
+
+        reader_result: list[tuple[list[str], int]] = []
+        reader_error: list[Exception] = []
+        reader_thread = threading.Thread(
+            target=self._consume_since_offset,
+            args=(handler, thread_id, offset, reader_result, reader_error),
+            daemon=True,
+        )
+        reader_thread.start()
+        assert reader_holding_snapshot.wait(timeout=3)
+
+        handler.put(thread_id, "msg_after_refresh")
+        flush_thread = threading.Thread(target=handler.flush, args=(thread_id,), daemon=True)
+        flush_thread.start()
+
+        try:
+            flush_thread.join(timeout=0.3)
+            assert not flush_thread.is_alive(), "producer flush was blocked by a replay reader snapshot"
+        finally:
+            release_reader_snapshot.set()
+            flush_thread.join(timeout=3)
+            reader_thread.join(timeout=3)
+
+        assert reader_error == []
+        assert reader_result == [(["msg_after_refresh"], offset + 1)]
 
     def test_consumer_reconnect_with_dlq(self, handler, thread_id):
         """测试消费者断开后重连可以从死信队列恢复消息
