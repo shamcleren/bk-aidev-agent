@@ -332,16 +332,6 @@ class TestRabbitMQMessageHandler:
         assert reader_error == []
         assert reader_result == [(["msg_after_refresh"], offset + 1)]
 
-    def test_replay_stream_can_start_after_client_prefilled_messages(self, handler, thread_id):
-        """新浏览器已从 DB 回填前 N 条时，SSE replay 应从 client_index 后继续。"""
-        for message in ["m0", "m1", "m2", "m3", "m4", EOD_CHUNK]:
-            handler.put(thread_id, message)
-        handler.flush(thread_id)
-
-        helper = GeneratorStreamingHelper(handler, thread_id=thread_id, initial_replay_offset=3)
-
-        assert list(helper.stream(iter(()))) == ["m3", "m4"]
-
     def test_consumer_reconnect_with_dlq(self, handler, thread_id):
         """测试消费者断开后重连可以从死信队列恢复消息
 

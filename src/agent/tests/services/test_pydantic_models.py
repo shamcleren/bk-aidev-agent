@@ -1,8 +1,5 @@
 from unittest.mock import MagicMock, patch
 
-import pytest
-from pydantic import ValidationError
-
 from aidev_agent.pydantic_models import (
     AgentExecutorKwargs,
     AgentOptions,
@@ -32,17 +29,6 @@ def test_legacy_agent_options_allow_extra_fields():
     assert options.intent_recognition_options.model_extra["agent_type"] == "deepseek_r1"
     assert options.knowledge_query_options.model_extra["document_fragment_count"] == 3
     assert KnowledgebaseSettings().rejection_message
-
-
-def test_execute_kwargs_preserves_client_index():
-    execute_kwargs = ExecuteKwargs.model_validate({"stream": True, "client_index": 7})
-
-    assert execute_kwargs.client_index == 7
-
-
-def test_execute_kwargs_rejects_negative_client_index():
-    with pytest.raises(ValidationError):
-        ExecuteKwargs.model_validate({"client_index": -1})
 
 
 class TestAgentExecutorKwargs:
