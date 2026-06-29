@@ -134,7 +134,8 @@ class FlowAgentCompletionAgent(BaseModel):
             execute_kwargs: 兼容 ChatCompletionAgent 接口，FlowAgent 中不使用
         """
         stream_thread_id = self.session_code or self.thread_id
-        helper = GeneratorStreamingHelper(thread_id=stream_thread_id)
+        client_index = getattr(execute_kwargs, "client_index", 0) if execute_kwargs is not None else 0
+        helper = GeneratorStreamingHelper(thread_id=stream_thread_id, initial_replay_offset=client_index)
         return helper.stream(self._run_flow())
 
     def stop(self):

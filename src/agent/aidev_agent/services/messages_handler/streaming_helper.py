@@ -93,9 +93,15 @@ class GeneratorStreamingHelper:
                 return True
         return False
 
-    def __init__(self, message_handler: BaseMessageQueueHandler | None = None, thread_id: str | None = None) -> None:
+    def __init__(
+        self,
+        message_handler: BaseMessageQueueHandler | None = None,
+        thread_id: str | None = None,
+        initial_replay_offset: int = 0,
+    ) -> None:
         self.message_handler = message_handler if message_handler else message_handler_factory.get()
         self.thread_id = thread_id or uuid.uuid4().hex
+        self.initial_replay_offset = max(initial_replay_offset, 0)
 
     @classmethod
     def _check_cancel_status(
@@ -292,7 +298,7 @@ class GeneratorStreamingHelper:
         """
         max_empty_rounds = 3  # 最多空轮询3次就结束
         empty_rounds = 0
-        replay_offset = 0
+        replay_offset = self.initial_replay_offset
         supports_replay_from_start = self._supports_replay_from_start()
 
         while True:
@@ -501,7 +507,7 @@ class GeneratorStreamingHelper:
         yielded_total = 0
         exit_reason = "unknown"
         last_progress_ts = time.time()
-        replay_offset = 0
+        replay_offset = self.initial_replay_offset
         supports_replay_from_start = self._supports_replay_from_start()
 
         logger.info(

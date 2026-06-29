@@ -26,6 +26,7 @@ class ExecuteKwargs(BaseModel):
     thread_id: str | None = Field(default=None, description="Thread ID，用于APIGW调用时自动管理会话")
     version: str | None = Field(default=None, description="agent 配置版本；为空则使用最新版本")
     turn_id: str = Field(default="", description="同一次 user-ai 回复的轮次 ID")
+    client_index: int = Field(default=0, ge=0, description="流式续传时客户端已消费的 SSE 消息 offset")
 
     # 执行配置
     legacy_streaming: bool = Field(default=False, description="是否使用 legacy streaming protocol")

@@ -424,10 +424,19 @@ class ChatCompletionAgent(BaseModel):
             mcp_fetch_failures=getattr(self, "mcp_fetch_failures", []) or [],
         )
 
-        return self._stream_with_queue(agui_entry, agent_input, queue_thread_id=self.thread_id)
+        return self._stream_with_queue(
+            agui_entry,
+            agent_input,
+            queue_thread_id=self.thread_id,
+            initial_replay_offset=execute_kwargs.client_index,
+        )
 
     def _stream_with_queue(
-        self, agui_entry: AidevAGUIAgent, agent_input: AgentInput, queue_thread_id: str | None = None
+        self,
+        agui_entry: AidevAGUIAgent,
+        agent_input: AgentInput,
+        queue_thread_id: str | None = None,
+        initial_replay_offset: int = 0,
     ) -> Generator[Any, None, None]:
         """使用队列处理器缓存流式请求，支持断点续传
 
@@ -448,6 +457,7 @@ class ChatCompletionAgent(BaseModel):
         """
         helper = GeneratorStreamingHelper(
             thread_id=queue_thread_id or agent_input.thread_id,
+            initial_replay_offset=initial_replay_offset,
         )
         return helper.stream(async_to_sync_generator(agui_entry.run(agent_input)), on_complete=self._on_complete)
 
