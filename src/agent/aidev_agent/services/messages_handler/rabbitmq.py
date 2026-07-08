@@ -454,8 +454,8 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
     def _wait_for_replay_retry(self, deadline: float | None, interval: float) -> None:
         """等待下一次 replay 检查。
 
-        本进程内有 buffer 写入或 replay lock 释放时会提前唤醒；跨进程 RabbitMQ 写入
-        无法通过本地 Condition 感知，因此仍保留短超时作为兜底重试。
+        本进程内有 RabbitMQ 提交或 replay lock 释放时会提前唤醒；跨进程 RabbitMQ
+        写入无法通过本地 Condition 感知，因此仍保留短超时作为兜底重试。
         """
         wait_time = interval
         if deadline is not None:
@@ -984,7 +984,6 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
             if thread_id not in self._message_buffer:
                 self._message_buffer[thread_id] = []
             self._message_buffer[thread_id].append(message)
-        self._notify_replay_waiters()
 
     def _take_thread_buffer_for_flush(self, thread_id: str) -> list[Any]:
         """取出一个 thread 的待发布 buffer，并标记本进程内该 thread 正在 flush。"""
@@ -1008,18 +1007,6 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
                 self._message_buffer[thread_id] = messages_to_restore + current_messages
             self._flushing_threads.discard(thread_id)
             self._buffer_condition.notify_all()
-
-    def _wait_for_local_flush(self, thread_id: str, deadline: Optional[float]) -> None:
-        """等待本进程内同一 thread 的 in-flight flush 结束后再构造 replay 快照。"""
-        with self._buffer_condition:
-            while thread_id in self._flushing_threads:
-                if deadline is not None:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        raise TimeoutError("No message available within timeout")
-                    self._buffer_condition.wait(timeout=min(self.REPLAY_MESSAGE_RETRY_INTERVAL, remaining))
-                else:
-                    self._buffer_condition.wait(timeout=self.REPLAY_MESSAGE_RETRY_INTERVAL)
 
     def flush(self, thread_id: Optional[str] = None) -> None:
         """立即推送缓冲区中的消息到 RabbitMQ
@@ -1130,7 +1117,6 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
 
         while True:
             try:
-                self._wait_for_local_flush(thread_id, deadline)
                 with self._with_replay_lock(thread_id) as channel:
                     main_queue_name = self._ensure_queue(channel=channel, thread_id=thread_id)
                     all_messages = self._peek_queue_messages(channel, main_queue_name)
@@ -1144,13 +1130,6 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
                             restored,
                         )
                         all_messages = self._peek_queue_messages(channel, main_queue_name)
-
-                    # 本进程内 flush 标记覆盖本地 buffer 合并，避免 flush 已从 buffer
-                    # 取走但尚未发布的旧消息被同进程后续 buffer 消息越过。
-                    with self._buffer_lock:
-                        if thread_id in self._flushing_threads:
-                            continue
-                        all_messages.extend(self._message_buffer.get(thread_id, []))
 
                 next_offset = len(all_messages)
                 if next_offset > offset:
@@ -1229,6 +1208,8 @@ class RabbitMQMessageHandler(MultiProcessMixin, BaseMessageQueueHandler):
         # 检查本地缓冲区
         with self._buffer_lock:
             if thread_id in self._message_buffer and self._message_buffer[thread_id]:
+                return True
+            if thread_id in self._flushing_threads:
                 return True
 
         # 检查 RabbitMQ 主队列和死信队列

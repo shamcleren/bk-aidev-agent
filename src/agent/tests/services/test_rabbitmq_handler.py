@@ -261,34 +261,98 @@ class TestRabbitMQMessageHandler:
         self._wait_until_empty(handler, thread_id)
 
     def test_single_consumer_waits_for_in_flight_flush_before_later_buffer(self, handler, thread_id, monkeypatch):
-        """单个 consumer 不应在旧 flush 批次发布完成前先吐出后续 buffer 消息。"""
+        """单个 consumer 不应在旧 flush 批次发布完成前先吐出后续未提交消息。"""
         handler.put(thread_id, "msg_0")
         handler.flush(thread_id)
         first_messages, offset = handler.get_messages_since(thread_id, 0, timeout=1)
         assert first_messages == ["msg_0"]
 
-        handler.put(thread_id, "msg_1")
-        publish_started, allow_publish = self._patch_delayed_publish(monkeypatch, handler, "msg_1")
-        result: list[tuple[list[str], int]] = []
-        error: list[Exception] = []
-        flush_thread = threading.Thread(target=handler.flush, args=(thread_id,), daemon=True)
-        consumer_thread = threading.Thread(
-            target=self._consume_since_offset, args=(handler, thread_id, offset, result, error), daemon=True
-        )
-        flush_thread.start()
-        assert publish_started.wait(timeout=3)
-        handler.put(thread_id, "msg_2")
-        consumer_thread.start()
+        handler._stop_daemon()
+        monkeypatch.setattr(handler, "_ensure_daemon_alive", lambda: None)
         try:
-            consumer_thread.join(timeout=0.3)
-            assert consumer_thread.is_alive(), f"consumer returned too early: result={result}, error={error}"
-        finally:
-            allow_publish.set()
-            flush_thread.join(timeout=3)
-            consumer_thread.join(timeout=3)
+            handler.put(thread_id, "msg_1")
+            publish_started, allow_publish = self._patch_delayed_publish(monkeypatch, handler, "msg_1")
+            result: list[tuple[list[str], int]] = []
+            error: list[Exception] = []
+            flush_thread = threading.Thread(target=handler.flush, args=(thread_id,), daemon=True)
+            consumer_thread = threading.Thread(
+                target=self._consume_since_offset, args=(handler, thread_id, offset, result, error), daemon=True
+            )
+            flush_thread.start()
+            assert publish_started.wait(timeout=3)
+            handler.put(thread_id, "msg_2")
+            consumer_thread.start()
+            try:
+                consumer_thread.join(timeout=0.3)
+                assert consumer_thread.is_alive(), f"consumer returned too early: result={result}, error={error}"
+            finally:
+                allow_publish.set()
+                flush_thread.join(timeout=3)
+                consumer_thread.join(timeout=3)
 
-        assert error == []
-        assert result == [(["msg_1", "msg_2"], 3)]
+            assert error == []
+            assert result == [(["msg_1"], 2)]
+
+            handler.flush(thread_id)
+            second_messages, next_offset = handler.get_messages_since(thread_id, 2, timeout=1)
+
+            assert second_messages == ["msg_2"]
+            assert next_offset == 3
+        finally:
+            handler._start_daemon()
+
+    def test_replay_reads_only_rabbitmq_committed_messages(self, handler, thread_id, monkeypatch):
+        """Replay 只能读取 RabbitMQ 已提交日志，不能读取本进程未 flush 的 buffer。"""
+        handler._stop_daemon()
+        monkeypatch.setattr(handler, "_ensure_daemon_alive", lambda: None)
+
+        try:
+            handler.put(thread_id, "buffered_only")
+
+            with pytest.raises(TimeoutError):
+                handler.get_messages_since(thread_id, 0, timeout=0.2)
+
+            handler.flush(thread_id)
+            messages, offset = handler.get_messages_since(thread_id, 0, timeout=1)
+
+            assert messages == ["buffered_only"]
+            assert offset == 1
+        finally:
+            with handler._buffer_lock:
+                handler._message_buffer.pop(thread_id, None)
+            handler._start_daemon()
+
+    def test_has_pending_messages_includes_in_flight_flush(self, handler, thread_id):
+        """本批消息从 buffer 取走但尚未 publish 时，仍应被视为 pending。"""
+        handler._stop_daemon()
+        try:
+            with handler._buffer_lock:
+                handler._message_buffer[thread_id] = ["in_flight_msg"]
+
+            messages_to_flush = handler._take_thread_buffer_for_flush(thread_id)
+            try:
+                assert messages_to_flush == ["in_flight_msg"]
+                assert handler.has_pending_messages(thread_id) is True
+            finally:
+                handler._finish_thread_flush(thread_id, messages_to_restore=messages_to_flush)
+        finally:
+            handler._start_daemon()
+
+    def test_disconnected_replay_consumer_schedules_orphan_cleanup(self, handler, thread_id, monkeypatch):
+        """已有 pending 日志的 replay consumer 中途断开后，也应延迟清理孤儿队列。"""
+        for message in ["msg_1", "msg_2", "msg_3"]:
+            handler.put(thread_id, message)
+        handler.flush(thread_id)
+
+        helper = GeneratorStreamingHelper(handler, thread_id)
+        monkeypatch.setattr(helper, "_PRODUCER_CLEANUP_DELAY", 0.2)
+        monkeypatch.setattr(helper, "_ORPHAN_CLEANUP_POLL_INTERVAL", 0.05)
+
+        stream = helper.stream(iter(()))
+        assert next(stream) == "msg_1"
+        stream.close()
+
+        self._wait_until_empty(handler, thread_id, timeout=1.0)
 
     def test_replay_reader_does_not_block_producer_flush(self, handler, thread_id, monkeypatch):
         """正在等待增量的 replay consumer 不应阻塞 producer flush 新消息。"""
